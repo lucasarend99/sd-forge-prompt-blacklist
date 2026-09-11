@@ -85,6 +85,42 @@ def filter_text(text: str, pattern: re.Pattern | None) -> str:
     return cleanup(filtered)
 
 
+NEGATIVE_TAG_PATTERN = re.compile(r"<\s*negativeprompt\s*:\s*([^<>]*)>", re.IGNORECASE)
+
+
+def extract_negative_tags(text: str) -> tuple[str, list[str]]:
+    """Pull tags out of inline <NegativePrompt:tag1,tag2> markers.
+
+    Returns the prompt text with the markers removed, plus the flat list of
+    tags collected from every marker found (order preserved).
+    """
+    if not text:
+        return text or "", []
+    matches = NEGATIVE_TAG_PATTERN.findall(text)
+    if not matches:
+        return text, []
+    tags = [t.strip() for group in matches for t in group.split(",") if t.strip()]
+    cleaned = cleanup(NEGATIVE_TAG_PATTERN.sub("", text))
+    return cleaned, tags
+
+
+def merge_negative(existing: str, tags: list[str]) -> str:
+    if not tags:
+        return existing or ""
+    existing = (existing or "").strip()
+    addition = ", ".join(tags)
+    if not existing:
+        return addition
+    return f"{existing}, {addition}"
+
+
+def extract_and_merge(prompt_text: str, neg_text: str) -> tuple[str, str]:
+    cleaned, tags = extract_negative_tags(prompt_text)
+    if not tags:
+        return prompt_text, neg_text
+    return cleaned, merge_negative(neg_text, tags)
+
+
 def live_filter(prompt_text: str, enabled: bool, blacklist_text: str):
     if not enabled or not blacklist_text or not prompt_text:
         return gr.update()
@@ -95,6 +131,30 @@ def live_filter(prompt_text: str, enabled: bool, blacklist_text: str):
     if result == prompt_text:
         return gr.update()
     return result
+
+
+def live_extract_negative(prompt_text: str, neg_text: str, enabled: bool, pos_blacklist: str, neg_blacklist: str):
+    if not enabled or not prompt_text:
+        return gr.update(), gr.update()
+
+    prompt_text = prompt_text or ""
+    neg_text = neg_text or ""
+
+    cleaned_prompt, tags = extract_negative_tags(prompt_text)
+    if not tags:
+        return gr.update(), gr.update()
+
+    pos_pattern = build_pattern(parse_blacklist(pos_blacklist))
+    new_prompt = filter_text(cleaned_prompt, pos_pattern) if pos_pattern else cleaned_prompt
+
+    new_neg = merge_negative(neg_text, tags)
+    neg_pattern = build_pattern(parse_blacklist(neg_blacklist))
+    if neg_pattern is not None:
+        new_neg = filter_text(new_neg, neg_pattern)
+
+    prompt_update = new_prompt if new_prompt != prompt_text else gr.update()
+    neg_update = new_neg if new_neg != neg_text else gr.update()
+    return prompt_update, neg_update
 
 
 class PromptBlacklist(scripts.Script):
@@ -139,7 +199,9 @@ class PromptBlacklist(scripts.Script):
                 reload_btn = gr.Button("Reload from disk", variant="secondary")
             gr.Markdown(
                 "Whole-word match, case-insensitive. Settings auto-save on every keystroke and persist between sessions. "
-                "Prompts are also filtered live when edited (e.g. when Tagger sends tags to txt2img)."
+                "Prompts are also filtered live when edited (e.g. when Tagger sends tags to txt2img). "
+                "Inline markers like `<NegativePrompt:tag1,tag2,tag3>` are automatically pulled out of the "
+                "positive prompt and appended to the negative prompt."
             )
 
             for component in (enabled, positive, negative):
@@ -183,6 +245,20 @@ class PromptBlacklist(scripts.Script):
                 show_progress=False,
             )
 
+            if self._neg_prompt_component is not None:
+                self._prompt_component.change(
+                    fn=live_extract_negative,
+                    inputs=[self._prompt_component, self._neg_prompt_component, enabled, positive, negative],
+                    outputs=[self._prompt_component, self._neg_prompt_component],
+                    show_progress=False,
+                )
+                clean_now.click(
+                    fn=live_extract_negative,
+                    inputs=[self._prompt_component, self._neg_prompt_component, enabled, positive, negative],
+                    outputs=[self._prompt_component, self._neg_prompt_component],
+                    show_progress=False,
+                )
+
         if self._neg_prompt_component is not None:
             self._neg_prompt_component.change(
                 fn=live_filter,
@@ -202,6 +278,24 @@ class PromptBlacklist(scripts.Script):
     def process(self, p, enabled, positive_blacklist, negative_blacklist):
         if not enabled:
             return
+
+        p.prompt, p.negative_prompt = extract_and_merge(p.prompt, p.negative_prompt)
+        if getattr(p, "all_prompts", None) and getattr(p, "all_negative_prompts", None):
+            for i in range(min(len(p.all_prompts), len(p.all_negative_prompts))):
+                p.all_prompts[i], p.all_negative_prompts[i] = extract_and_merge(
+                    p.all_prompts[i], p.all_negative_prompts[i]
+                )
+        if getattr(p, "main_prompt", None):
+            p.main_prompt, p.negative_prompt = extract_and_merge(p.main_prompt, p.negative_prompt)
+        if getattr(p, "hr_prompt", None):
+            p.hr_prompt, p.hr_negative_prompt = extract_and_merge(
+                p.hr_prompt, getattr(p, "hr_negative_prompt", "")
+            )
+        if getattr(p, "all_hr_prompts", None) and getattr(p, "all_hr_negative_prompts", None):
+            for i in range(min(len(p.all_hr_prompts), len(p.all_hr_negative_prompts))):
+                p.all_hr_prompts[i], p.all_hr_negative_prompts[i] = extract_and_merge(
+                    p.all_hr_prompts[i], p.all_hr_negative_prompts[i]
+                )
 
         pos_pattern = build_pattern(parse_blacklist(positive_blacklist))
         neg_pattern = build_pattern(parse_blacklist(negative_blacklist))
@@ -233,10 +327,15 @@ class PromptBlacklist(scripts.Script):
         if not enabled:
             return
 
+        prompts = kwargs.get("prompts")
+        negative_prompts = getattr(p, "negative_prompts", None)
+        if prompts is not None and negative_prompts is not None:
+            for i in range(min(len(prompts), len(negative_prompts))):
+                prompts[i], negative_prompts[i] = extract_and_merge(prompts[i], negative_prompts[i])
+
         pos_pattern = build_pattern(parse_blacklist(positive_blacklist))
         neg_pattern = build_pattern(parse_blacklist(negative_blacklist))
 
-        prompts = kwargs.get("prompts")
         if pos_pattern is not None and prompts is not None:
             for i, t in enumerate(prompts):
                 prompts[i] = filter_text(t, pos_pattern)
